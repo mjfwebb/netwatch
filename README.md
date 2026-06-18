@@ -109,3 +109,7 @@ desktop's traffic. Other users' sockets need root.
 Tests live in `tests/` and run with
 [bats](https://github.com/bats-core/bats-core) (`bats tests`); CI also runs
 `shellcheck`. See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions.
+
+## License
+
+Released under the [MIT License](LICENSE).
