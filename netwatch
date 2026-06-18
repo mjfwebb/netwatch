@@ -11,7 +11,7 @@ export LC_ALL=C
 
 # Bump on release. install.sh greps this line to report what an update did.
 # shellcheck disable=SC2034  # read externally by install.sh and the release job
-VERSION=0.1.0
+VERSION=0.2.0
 
 # Subcommand: self-update by re-running the installer. Handled before the
 # positional interval below, which would otherwise read "update" as an interval.
