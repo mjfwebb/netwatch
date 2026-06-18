@@ -21,37 +21,6 @@ Refreshing on an interval, it shows:
 Rates are **colour-coded** by how busy the link is: green below 100 KB/s, cyan
 to 2 MB/s, yellow to 10 MB/s, red above.
 
-## How it attributes spikes
-
-Counting connections is misleading — a browser idling on 30 QUIC sockets would
-always outvote the one socket doing a 1 GB download. So on a spike netwatch
-takes two snapshots of `ss -tinp` a third of a second apart and diffs each TCP
-socket's cumulative byte counters (`bytes_sent` / `bytes_received`, which
-`ss -i` exposes), blaming programs by **bytes actually moved** in that window.
-
-Because throughput is reported in aggregate (like temperature lags load), the
-culprit is whatever has been moving bytes over the last moment. This
-investigation runs **only on a spike**, so the steady-state loop stays cheap.
-
-It also names the **remote host** each program moved the most bytes to,
-reverse-resolving the busiest peer IP via `getent` (NSS, behind a 1 s timeout),
-and falling back to the bare IP when there is no PTR record. This is what turns
-a vague `firefox` into `firefox → r5.googlevideo.com` — the answer to "what is
-it actually pulling". A browser owns the socket in its parent/network process,
-not the per-tab process, so a *tab title* isn't recoverable from a socket; the
-remote host is as specific as the kernel can tell you, and usually the more
-useful of the two anyway.
-
-Without root, `ss -p` still attributes the **user's own** sockets — browsers,
-sync clients, `ssh`, `apt`, downloads — which is almost always what drives a
-desktop's traffic. Sockets owned by other users need root to attribute.
-
-> Note: TCP byte counters come from the kernel's `tcp_info`, so a burst carried
-> over **QUIC/UDP** (much streaming, some browser traffic) has no per-socket
-> counters. When no TCP bytes moved in the window, netwatch falls back to
-> naming the programs holding the most live connections instead (shown as
-> `name (N)` connection counts rather than byte totals).
-
 ## Install
 
 One line, no clone needed — and re-running the same line updates an existing
@@ -91,6 +60,37 @@ The spike threshold that triggers culprit attribution is configurable:
 ```bash
 NETWATCH_RISE=2000 netwatch    # only investigate jumps of ≥ 2 MB/s
 ```
+
+## How it attributes spikes
+
+Counting connections is misleading — a browser idling on 30 QUIC sockets would
+always outvote the one socket doing a 1 GB download. So on a spike netwatch
+takes two snapshots of `ss -tinp` a third of a second apart and diffs each TCP
+socket's cumulative byte counters (`bytes_sent` / `bytes_received`, which
+`ss -i` exposes), blaming programs by **bytes actually moved** in that window.
+
+Because throughput is reported in aggregate (like temperature lags load), the
+culprit is whatever has been moving bytes over the last moment. This
+investigation runs **only on a spike**, so the steady-state loop stays cheap.
+
+It also names the **remote host** each program moved the most bytes to,
+reverse-resolving the busiest peer IP via `getent` (NSS, behind a 1 s timeout),
+and falling back to the bare IP when there is no PTR record. This is what turns
+a vague `firefox` into `firefox → r5.googlevideo.com` — the answer to "what is
+it actually pulling". A browser owns the socket in its parent/network process,
+not the per-tab process, so a *tab title* isn't recoverable from a socket; the
+remote host is as specific as the kernel can tell you, and usually the more
+useful of the two anyway.
+
+Without root, `ss -p` still attributes the **user's own** sockets — browsers,
+sync clients, `ssh`, `apt`, downloads — which is almost always what drives a
+desktop's traffic. Sockets owned by other users need root to attribute.
+
+> Note: TCP byte counters come from the kernel's `tcp_info`, so a burst carried
+> over **QUIC/UDP** (much streaming, some browser traffic) has no per-socket
+> counters. When no TCP bytes moved in the window, netwatch falls back to
+> naming the programs holding the most live connections instead (shown as
+> `name (N)` connection counts rather than byte totals).
 
 ## How it reads things
 
