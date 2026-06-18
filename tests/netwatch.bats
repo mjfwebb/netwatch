@@ -54,7 +54,7 @@ setup() {
 @test "arrow is a blank space when there is no previous sample" {
   source "$NW"
   run arrow 65 ""
-  [ "$output" = "" ]   # a single space, which bats trims to empty
+  [ "$output" = " " ]   # a single space, to hold the column's width
 }
 
 # --- sparkline: log-scale the throughput history to block glyphs -------------

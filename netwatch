@@ -10,6 +10,7 @@
 export LC_ALL=C
 
 # Bump on release. install.sh greps this line to report what an update did.
+# shellcheck disable=SC2034  # read externally by install.sh and the release job
 VERSION=0.1.0
 
 # Subcommand: self-update by re-running the installer. Handled before the
@@ -44,7 +45,7 @@ if [[ -t 1 ]]; then
   R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; C=$'\e[36m'
   GR=$'\e[90m'; BOLD=$'\e[1m'; RST=$'\e[0m'
 else
-  R= G= Y= B= C= GR= BOLD= RST=
+  R='' G='' Y='' B='' C='' GR='' BOLD='' RST=''
 fi
 
 # Human-readable byte rate. Integer bash maths can't do the decimal, so awk
@@ -92,7 +93,6 @@ arrow() { local cur=$1 prev=$2
 # scale between min and max keeps the shape of the ordinary traffic readable
 # while the spike still tops out at █. A flat window (all values equal, incl.
 # all-zero) has no range, so it renders as a flat run of ▁.
-SPARK=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
 hist=()
 sparkline() {
   (( ${#hist[@]} == 0 )) && return
