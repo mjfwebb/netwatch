@@ -4,6 +4,8 @@ A live terminal monitor for **network throughput** that **blames traffic spikes
 on the programs that caused them**. Reads only `/proc` and `ss`, so no root is
 required.
 
+![netwatch output: a pinned header above timestamped rows of download/upload/total rates (green, cyan, then red as they climb) with trend arrows and a log-scaled sparkline, and a culprit callout blaming a traffic spike on curl → speed.hetzner.de and firefox → dns.google](example.svg)
+
 Each refresh shows:
 
 - **Download & upload rates** (summed across every interface but loopback), each
