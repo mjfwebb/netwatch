@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # labeled/unlabeled so the bump-label check re-runs when a label is toggled
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: bats tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Run tests
+        run: bats tests
+
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Lint the scripts
+        run: shellcheck netwatch install.sh
+
+  # The VERSION= line is owned by main, not by PRs: it is bumped once per
+  # release by the `release` job below. A PR that edits it would contend with
+  # any other open PR over the number, and merge order would silently decide
+  # the winner. So PRs must leave it untouched (see CONTRIBUTING.md, Releases).
+  no-version-change:
+    name: no version change
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - name: Reject VERSION changes in PRs
+        run: |
+          base=origin/${{ github.base_ref }}
+          # three-dot range: diff against the merge base, so a bump that landed
+          # on main after this PR branched doesn't read as the PR's own change.
+          if git diff "$base"...HEAD -- netwatch | grep -qE '^[+-]VERSION='; then
+            echo "::error file=netwatch::PRs must not change the VERSION= line; it is bumped on main after merge (see CONTRIBUTING.md, Releases)."
+            exit 1
+          fi
+          echo "VERSION untouched"
+
+  # Every PR must declare its release intent with exactly one bump:* label, so
+  # the release job on main knows how to version it (and nothing slips through
+  # on the implicit default). If none is set, post a comment asking for one and
+  # fail; the check re-runs when a label is added.
+  bump-label:
+    name: bump label
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      MARKER: <!-- bump-label-check -->
+    steps:
+      - name: Require exactly one bump:* label
+        run: |
+          set -euo pipefail
+          labels=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" --jq '.[].name')
+          n=$(grep -cE '^bump:(major|minor|patch|none)$' <<<"$labels" || true)
+          if [[ $n -eq 1 ]]; then
+            echo "bump label present: $(grep -E '^bump:' <<<"$labels")"
+            # Resolved: drop any stale prompt comment.
+            id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+                   --jq "map(select(.body | startswith(\"$MARKER\"))) | .[-1].id // empty")
+            [[ -n $id ]] && gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/$id" || true
+            exit 0
+          fi
+
+          if [[ $n -gt 1 ]]; then
+            msg="This PR has more than one \`bump:*\` label. Keep exactly one."
+          else
+            msg="This PR has no release label. Add exactly one of \`bump:major\`, \`bump:minor\`, \`bump:patch\`, or \`bump:none\` so the release job knows how to version it after merge."
+          fi
+          body=$(printf '%s\n%s\n\nSee CONTRIBUTING.md (Releases) for what each level means.' "$MARKER" "$msg")
+          # Update the existing prompt comment if present, else create one.
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+                 --jq "map(select(.body | startswith(\"$MARKER\"))) | .[-1].id // empty")
+          if [[ -n $id ]]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/$id" -f body="$body" >/dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$body" >/dev/null
+          fi
+          echo "::error::PR needs exactly one bump:* label"
+          exit 1
+
+  # On main, cut a release when netwatch changed since the last tag. CI owns
+  # the version end to end: the new number is computed from the last tag, the
+  # bump level comes from the merged PR's label (bump:major / bump:minor, else
+  # patch), and the job writes VERSION, commits, and tags vX.Y.Z. Nobody edits
+  # VERSION by hand. Runs only after tests and lint pass, so a broken main is
+  # never tagged.
+  release:
+    name: release tag
+    if: github.event_name == 'push'
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - name: Compute version, bump, and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Bump level from the label on the PR(s) merged by this push; major
+          # wins over minor over patch. bump:none, or a direct push with no
+          # associated PR (e.g. the bump commit below), releases nothing. The
+          # label is the whole gate: an unlabeled push never releases.
+          labels=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                     --jq '.[].labels[].name' 2>/dev/null || true)
+          if   grep -qx 'bump:major' <<<"$labels"; then level=major
+          elif grep -qx 'bump:minor' <<<"$labels"; then level=minor
+          elif grep -qx 'bump:patch' <<<"$labels"; then level=patch
+          else echo "no bump:major/minor/patch label; skipping release"; exit 0
+          fi
+
+          # The current VERSION= line is the source of truth for what shipped
+          # (install.sh reports it); the new number is bumped from there. Tags
+          # are derived, so a repo that versioned without tagging still bumps
+          # from its real version rather than restarting at 0.
+          cur_ver=$(sed -n 's/^VERSION=//p' netwatch | head -n1)
+          [[ $cur_ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::VERSION '$cur_ver' is not X.Y.Z"; exit 1; }
+          IFS=. read -r major minor patch <<<"$cur_ver"
+          case $level in
+            major) new_ver="$((major + 1)).0.0" ;;
+            minor) new_ver="$major.$((minor + 1)).0" ;;
+            patch) new_ver="$major.$minor.$((patch + 1))" ;;
+          esac
+          echo "releasing $cur_ver -> $new_ver ($level)"
+
+          sed -i "s/^VERSION=.*/VERSION=$new_ver/" netwatch
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Bump version to $new_ver"
+          git push origin HEAD:main
+          git tag "v$new_ver"
+          git push origin "v$new_ver"
+          echo "released v$new_ver"

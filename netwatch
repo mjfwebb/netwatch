@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# netwatch - live network throughput monitor with spike attribution.
+# Shows download/upload rates with trend arrows, a sparkline of recent total
+# throughput, and a callout that blames the busiest programs whenever traffic
+# spikes. Reads only /proc and `ss`, so no root is required.
+#
+# Usage: netwatch [interval_seconds]   (default 2)
+#        netwatch update               (self-update in place)
+
+export LC_ALL=C
+
+# Bump on release. install.sh greps this line to report what an update did.
+VERSION=0.1.0
+
+# Subcommand: self-update by re-running the installer. Handled before the
+# positional interval below, which would otherwise read "update" as an interval.
+# NETWATCH_RAW_URL selects a fork/branch, matching install.sh's own override.
+if [[ ${1:-} == update ]]; then
+  shift
+  command -v curl >/dev/null 2>&1 || { printf 'netwatch: update needs curl on PATH\n' >&2; exit 1; }
+  raw_url=${NETWATCH_RAW_URL:-https://raw.githubusercontent.com/mjfwebb/netwatch/main}
+  # pipefail so a failed download surfaces instead of being masked by bash
+  # exiting 0 on empty stdin.
+  set -o pipefail
+  curl -fsSL "$raw_url/install.sh" | bash -s -- "$@"
+  exit $?
+fi
+
+interval="${1:-2}"
+# Coerce a bad interval to the default so the rate arithmetic below never
+# divides by zero or a non-number. Fractional intervals are fine (awk handles
+# them) and useful on bursty links.
+[[ $interval =~ ^[0-9]+([.][0-9]+)?$ && $interval != 0 && $interval != 0.0 ]] || interval=2
+
+NETDEV=/proc/net/dev
+
+# Investigate the likely culprit when total throughput jumps by at least this
+# many KB/s between samples (override with NETWATCH_RISE).
+RISE="${NETWATCH_RISE:-500}"
+RISE_BYTES=$(( RISE * 1024 ))
+
+# --- colors -----------------------------------------------------------------
+if [[ -t 1 ]]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; C=$'\e[36m'
+  GR=$'\e[90m'; BOLD=$'\e[1m'; RST=$'\e[0m'
+else
+  R= G= Y= B= C= GR= BOLD= RST=
+fi
+
+# Human-readable byte rate. Integer bash maths can't do the decimal, so awk
+# formats it: B/s under 1K, then KB/s, MB/s, GB/s.
+fmt_rate() {
+  awk -v b="$1" 'BEGIN {
+    if      (b < 1024)              printf "%d B/s",    b
+    else if (b < 1048576)           printf "%.1f KB/s", b/1024
+    else if (b < 1073741824)        printf "%.1f MB/s", b/1048576
+    else                            printf "%.2f GB/s", b/1073741824
+  }'
+}
+
+# Human-readable byte size (cumulative, no /s) — used in the spike callout for
+# the bytes a program moved during the attribution window.
+fmt_size() {
+  awk -v b="$1" 'BEGIN {
+    if      (b < 1024)              printf "%d B",    b
+    else if (b < 1048576)           printf "%.1f KB", b/1024
+    else if (b < 1073741824)        printf "%.1f MB", b/1048576
+    else                            printf "%.2f GB", b/1073741824
+  }'
+}
+
+# color a throughput (bytes/s) by how busy the link is
+rcolor() { local b=$1
+  if   (( b < 102400 ));   then printf '%s' "$G"   # < 100 KB/s: idle/light
+  elif (( b < 2097152 ));  then printf '%s' "$C"   # < 2 MB/s
+  elif (( b < 10485760 )); then printf '%s' "$Y"   # < 10 MB/s
+  else                          printf '%s' "$R"; fi
+}
+
+# trend arrow comparing current vs previous rate
+arrow() { local cur=$1 prev=$2
+  [[ -z $prev ]] && { printf ' '; return; }
+  if   (( cur > prev )); then printf '%s▲%s' "$Y" "$RST"
+  elif (( cur < prev )); then printf '%s▼%s' "$B" "$RST"
+  else                        printf '%s—%s' "$GR" "$RST"; fi
+}
+
+# sparkline of the total-throughput history, scaled LOGARITHMICALLY between the
+# window's min and max. Network rates span orders of magnitude, so a linear
+# scale lets a single spike become the max and flatten every other sample to the
+# baseline (the history would appear to "reset" the moment a spike lands). A log
+# scale between min and max keeps the shape of the ordinary traffic readable
+# while the spike still tops out at █. A flat window (all values equal, incl.
+# all-zero) has no range, so it renders as a flat run of ▁.
+SPARK=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
+hist=()
+sparkline() {
+  (( ${#hist[@]} == 0 )) && return
+  printf '%s\n' "${hist[@]}" | awk '
+    { v[NR] = $1; if (NR == 1 || $1 < min) min = $1; if ($1 > max) max = $1 }
+    END {
+      split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", s, " ")
+      lo = log(min + 1); span = log(max + 1) - lo
+      for (i = 1; i <= NR; i++) {
+        idx = (span > 0) ? int((log(v[i] + 1) - lo) / span * 7 + 0.5) : 0
+        printf "%s", s[idx + 1]
+      }
+    }'
+}
+
+# --- counter reading ---------------------------------------------------------
+# Sum received/transmitted bytes across every interface except loopback, from
+# a /proc/net/dev-format file. The interface name is split off at its colon
+# first because the kernel's fixed-width format can glue a large byte count
+# straight onto the name (e.g. "wlp9s0:2742420328"). After the colon the RX
+# block is 8 fields (bytes is field 1) and TX bytes is field 9.
+parse_dev_totals() {
+  awk '
+    NR > 2 {
+      line = $0; sub(/^[[:space:]]*/, "", line)
+      c = index(line, ":"); if (c == 0) next
+      iface = substr(line, 1, c - 1)
+      if (iface == "lo") next
+      n = split(substr(line, c + 1), f, " ")
+      rx += f[1]; tx += f[9]
+    }
+    END { printf "%d %d", rx, tx }
+  ' "$1"
+}
+
+# --- culprit attribution -----------------------------------------------------
+# Throughput, like temperature, is reported in aggregate, so on a spike we work
+# out who caused it from `ss`. Counting connections is misleading — a browser
+# idling on 30 QUIC sockets would always outvote the one socket doing a 1 GB
+# download. So we instead diff each TCP socket's cumulative byte counters
+# (exposed by `ss -i`) across a short window and blame by bytes actually moved.
+# This runs ONLY on a spike, so the steady-state loop stays cheap. Without root
+# `ss -p` still attributes the user's own sockets (browsers, sync clients, ssh,
+# apt), which is almost always what drives a desktop's traffic.
+
+# Turn `ss -tinp`-style output on stdin into one "key bytes name" line per
+# socket: the header line carries the local/peer addresses (the key) and the
+# process, the indented info line that follows carries bytes_sent/bytes_received.
+parse_ss_snapshot() {
+  awk '
+    /^[A-Za-z]/ {                      # non-indented: a socket (or column) header
+      key = $4 "|" $5; name = ""
+      if (match($0, /\("[^"]+",pid=[0-9]+/)) {
+        name = substr($0, RSTART, RLENGTH); sub(/^\("/, "", name); sub(/",pid=[0-9]+$/, "", name)
+      }
+      next
+    }
+    /bytes_sent:|bytes_received:/ {     # indented info line for the socket above
+      bs = 0; br = 0
+      if (match($0, /bytes_sent:[0-9]+/))     { t = substr($0, RSTART, RLENGTH); sub(/bytes_sent:/, "", t);     bs = t }
+      if (match($0, /bytes_received:[0-9]+/)) { t = substr($0, RSTART, RLENGTH); sub(/bytes_received:/, "", t); br = t }
+      if (name != "") { print key, bs + br, name; name = "" }
+    }
+  '
+}
+
+# Given two parse_ss_snapshot outputs separated by a "===" line, sum the
+# positive per-socket byte deltas per program and emit the top 3 as raw
+# "bytes name peer-ip" lines, busiest first. The peer is the remote host that
+# moved the most of that program's bytes in the window (the key is
+# "local|peer", so the peer IP is the key's second half minus its :port).
+# Sockets only in the first snapshot, or that didn't move, are ignored.
+# Formatting and reverse-DNS of the peer happen in culprit_net, off the
+# (deterministic, testable) byte arithmetic here.
+diff_ss_bytes() {
+  awk '
+    /^===$/ { ph = 2; next }
+    ph != 2 { b1[$1] = $2; next }
+    ($1 in b1) && ($2 - b1[$1]) > 0 {
+      d = $2 - b1[$1]; name = $3
+      peer = $1; sub(/^[^|]*\|/, "", peer); sub(/:[0-9]+$/, "", peer)
+      sum[name] += d
+      pb[name SUBSEP peer] += d
+    }
+    END {
+      # pick each program busiest peer by bytes
+      for (k in pb) {
+        split(k, a, SUBSEP)
+        if (pb[k] > best[a[1]]) { best[a[1]] = pb[k]; peerof[a[1]] = a[2] }
+      }
+      for (n in sum) print sum[n], n, peerof[n]
+    }
+  ' | sort -rn | head -3
+}
+
+# Connection-count fallback for when no TCP bytes moved in the window — e.g.
+# the burst was QUIC/UDP (no per-socket counters) or already over. Aggregates
+# `ss -p`-style lines into "name (conns)" pairs, busiest first, top 3.
+parse_ss_culprit() {
+  awk '
+    match($0, /\("[^"]+",pid=[0-9]+/) {
+      seg = substr($0, RSTART, RLENGTH)
+      name = seg; sub(/^\("/, "", name); sub(/",pid=[0-9]+$/, "", name)
+      count[name]++
+    }
+    END { for (k in count) printf "%d %s\n", count[k], k }
+  ' | sort -rn | head -3 \
+    | awk '{ printf "%s%s (%s)", sep, $2, $1; sep=" · " }'
+}
+
+# Reverse-resolve a peer IP to a hostname so a vague "firefox" becomes
+# "firefox → dns.google". getent uses NSS (so /etc/hosts and the resolver),
+# behind a short timeout because a missing PTR record can otherwise hang on a
+# DNS round-trip. Falls back to the bare IP when there is no PTR (common for
+# CDN edges) or no resolver. The browser owns the socket, not the tab, so this
+# names the remote host the traffic is going to — which is the answer to "what
+# is it actually downloading", since a tab title isn't recoverable from a socket.
+resolve_host() {
+  local ip=$1 line
+  [[ -z $ip || $ip == "*" || $ip == 0.0.0.0 ]] && return
+  if command -v getent >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      line=$(timeout 1 getent hosts "$ip" 2>/dev/null)
+    else
+      line=$(getent hosts "$ip" 2>/dev/null)
+    fi
+  fi
+  # getent hosts prints "ADDR canonical alias..."; take the canonical name.
+  printf '%s' "$(awk '{print $2; exit}' <<<"$line")"
+}
+
+culprit_net() {
+  command -v ss >/dev/null 2>&1 || return
+  # Two snapshots a third of a second apart; the busiest programs by bytes
+  # moved between them are the spike's cause.
+  local s1 s2 bytes name peer host out="" sep=""
+  s1=$(ss -tinp state connected 2>/dev/null | parse_ss_snapshot)
+  sleep 0.3
+  s2=$(ss -tinp state connected 2>/dev/null | parse_ss_snapshot)
+  while read -r bytes name peer; do
+    [[ -z $name ]] && continue
+    host=$(resolve_host "$peer")
+    # "name → host" when we have a peer (resolved name, else the bare IP); just
+    # the program name when the peer couldn't be determined.
+    if [[ -n $peer ]]; then
+      out+="${sep}${name} → ${host:-$peer} ($(fmt_size "$bytes"))"
+    else
+      out+="${sep}${name} ($(fmt_size "$bytes"))"
+    fi
+    sep=" · "
+  done < <(printf '%s\n===\n%s\n' "$s1" "$s2" | diff_ss_bytes)
+
+  if [[ -n $out ]]; then
+    printf '%s' "$out"
+  else
+    # No TCP bytes moved (QUIC/UDP burst, or already over): name the programs
+    # holding the most live connections instead. state connected = everything
+    # but listening/closed sockets.
+    ss -tunp state connected 2>/dev/null | parse_ss_culprit
+  fi
+}
+
+cleanup() { printf '%s\n' "$RST"; exit 0; }
+
+# When sourced (by the tests), stop here: everything above is definitions and
+# read-only discovery; the header and loop below would otherwise run on source.
+[[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
+
+trap cleanup INT TERM
+
+# Prime the counters so the very first printed row already shows a real rate
+# rather than a meaningless since-boot total.
+read -r prev_rx prev_tx < <(parse_dev_totals "$NETDEV")
+prev_down=""; prev_up=""; prev_total=""
+
+printf '%snetwatch%s  every %ss — Ctrl+C to quit   (blames traffic spikes of ≥ %s KB/s on programs)\n' \
+  "$BOLD" "$RST" "$interval" "$RISE"
+# Right-align the rate headers in the same 11-wide columns as the data (with a
+# blank where each row's trend arrow goes) so the labels line up over the
+# right-aligned numbers instead of floating to the left of them.
+printf '%s%-8s  %11s %s  %11s %s  %11s   %s%s\n' \
+  "$GR" "time" "↓ download" " " "↑ upload" " " "total" "net trend (log-scaled)" "$RST"
+
+while :; do
+  sleep "$interval"
+
+  read -r rx tx < <(parse_dev_totals "$NETDEV")
+  # Per-second rates from the counter deltas. awk divides by the (possibly
+  # fractional) interval; a negative delta — counter reset or 64-bit wrap —
+  # clamps to 0 rather than printing a garbage spike.
+  down=$(awk -v a="$rx" -v b="$prev_rx" -v i="$interval" 'BEGIN { d=(a-b)/i; if (d<0) d=0; printf "%d", d }')
+  up=$(awk   -v a="$tx" -v b="$prev_tx" -v i="$interval" 'BEGIN { d=(a-b)/i; if (d<0) d=0; printf "%d", d }')
+  total=$(( down + up ))
+  ts=$(date +%H:%M:%S)
+
+  # track total-throughput history for the sparkline (keep last 40)
+  hist+=("$total"); (( ${#hist[@]} > 40 )) && hist=("${hist[@]: -40}")
+
+  # Rate fields are 11 wide — the widest a rate string gets ("1023.9 KB/s") —
+  # so a fast sample never overflows its column and shoves the arrow and
+  # sparkline rightward, which would leave the sparkline's left edge ragged.
+  printf '%s%-8s%s  %s%11s%s %s  %s%11s%s %s  %s%11s%s   %s\n' \
+    "$GR" "$ts" "$RST" \
+    "$(rcolor "$down")"  "$(fmt_rate "$down")"  "$RST" "$(arrow "$down" "$prev_down")" \
+    "$(rcolor "$up")"    "$(fmt_rate "$up")"    "$RST" "$(arrow "$up" "$prev_up")" \
+    "$(rcolor "$total")" "$(fmt_rate "$total")" "$RST" \
+    "$(sparkline)"
+
+  # culprit callout on a meaningful upward jump in total throughput
+  if [[ -n $prev_total ]] && (( total - prev_total >= RISE_BYTES )); then
+    blame=$(culprit_net)
+    jump=$(fmt_rate $(( total - prev_total )))
+    printf '   %s└─ %s▲ +%s%s  busiest: %s%s%s\n' \
+      "$GR" "$Y" "$jump" "$GR" "$RST" "${blame:-? (run as root to attribute sockets owned by other users)}" "$RST"
+  fi
+
+  prev_rx=$rx; prev_tx=$tx
+  prev_down=$down; prev_up=$up; prev_total=$total
+done
