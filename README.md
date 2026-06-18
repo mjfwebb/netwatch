@@ -19,6 +19,10 @@ Each refresh shows:
 Rates are **colour-coded** by load: green below 100 KB/s, cyan to 2 MB/s, yellow
 to 10 MB/s, red above.
 
+The header stays **pinned** to the top while rows scroll beneath it. Press
+**Shift+Tab** to switch to a **scrolling** layout that keeps history in your
+terminal's scrollback, or start there with `NETWATCH_STICKY=0`.
+
 ## Install
 
 One line, no clone needed, and re-running the same line updates an existing
@@ -51,12 +55,15 @@ netwatch 0.5    # fractional intervals are fine on bursty links
 netwatch update # self-update in place
 ```
 
-Press `Ctrl+C` to quit. No root required.
+Press `Ctrl+C` to quit, `Shift+Tab` to toggle the pinned/scrolling layout. No
+root required.
 
-The spike threshold for culprit attribution is configurable:
+The spike threshold for culprit attribution, and the starting layout, are
+configurable:
 
 ```bash
 NETWATCH_RISE=2000 netwatch    # only investigate jumps of ≥ 2 MB/s
+NETWATCH_STICKY=0 netwatch     # start in the scrolling layout, header unpinned
 ```
 
 ## How it attributes spikes
