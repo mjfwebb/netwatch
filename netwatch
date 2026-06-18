@@ -40,6 +40,10 @@ NETDEV=/proc/net/dev
 RISE="${NETWATCH_RISE:-500}"
 RISE_BYTES=$(( RISE * 1024 ))
 
+# Layout default: 1 pins the header to the top, 0 lets everything scroll.
+# Shift+Tab toggles it live on a terminal (see the layout section below).
+STICKY_PREF="${NETWATCH_STICKY:-1}"
+
 # --- colors -----------------------------------------------------------------
 if [[ -t 1 ]]; then
   R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; C=$'\e[36m'
@@ -255,29 +259,143 @@ culprit_net() {
   fi
 }
 
-cleanup() { printf '%s\n' "$RST"; exit 0; }
-
 # When sourced (by the tests), stop here: everything above is definitions and
-# read-only discovery; the header and loop below would otherwise run on source.
+# read-only discovery; the layout/loop below would otherwise run on source.
 [[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
 
+# --- terminal layout: pinned header vs scrolling ----------------------------
+# Two layouts. PINNED keeps the header fixed at the top while rows scroll
+# beneath it (a DECSTBM scroll region); SCROLLING lets everything scroll and
+# reprints the header each screenful so it stays in view with old rows left in
+# the terminal's scrollback. STICKY_PREF picks the default; Shift+Tab toggles it
+# live. STICKY is the layout actually in effect (pinning needs a tall-enough tty).
+STICKY=0
+
+# Single-keypress hotkeys need a non-canonical, no-echo terminal, but only when
+# stdin is a real tty (not a pipe or the tests, where we leave it alone and just
+# sleep between ticks). Save the termios so we can restore it on exit.
+KB=0; STTY_SAVE=""
+if [[ -t 0 ]] && STTY_SAVE=$(stty -g 2>/dev/null); then
+  stty -icanon -echo 2>/dev/null && KB=1
+fi
+# Restore on EXIT, not in the INT/TERM trap: `read -s` arranges to restore the
+# termios it saw (our raw mode) as the shell exits, which runs after the signal
+# trap and would clobber an in-trap restore. The EXIT trap runs last.
+restore_tty() { (( KB )) && [[ -n $STTY_SAVE ]] && stty "$STTY_SAVE" 2>/dev/null; }
+trap restore_tty EXIT
+
+cleanup() {
+  # Release the scroll region and drop the cursor below the data so the shell
+  # prompt returns under the output, not over the pinned header. (The tty mode
+  # is restored separately by the EXIT trap above.)
+  (( STICKY )) && printf '\e[r\e[%d;1H' "$ROWS"
+  printf '%s\n' "$RST"
+  exit 0
+}
 trap cleanup INT TERM
+
+# Usable terminal width/height, or 0 when stdout isn't a terminal (then: no
+# pinning, no reprint). A SIGWINCH trap refreshes these on resize, so we only
+# shell out to tput then. Fall back to 80x24 when tput can't tell us.
+COLS=0; ROWS=0
+get_dims() {
+  [[ -t 1 ]] || { COLS=0; ROWS=0; return; }
+  local c r
+  c=$(tput cols  2>/dev/null)
+  [[ $c =~ ^[1-9][0-9]*$ ]] || c=${COLUMNS-}
+  [[ $c =~ ^[1-9][0-9]*$ ]] || c=80
+  r=$(tput lines 2>/dev/null)
+  [[ $r =~ ^[1-9][0-9]*$ ]] || r=${LINES-}
+  [[ $r =~ ^[1-9][0-9]*$ ]] || r=24
+  COLS=$c; ROWS=$r
+}
+
+# Build the two header lines into hdr_lines[] (no trailing newlines) so the
+# pinned layout can reprint them on resize. The first line shows the live layout
+# and toggle hint, but only when stdin can actually receive the keypress.
+hdr_lines=()
+build_header() {
+  hdr_lines=(); local s keys=""
+  if (( KB )); then
+    local tag
+    if (( STICKY_PREF )); then printf -v tag '%s▔ PINNED%s'    "$C" "$RST"
+    else                       printf -v tag '%s↕ SCROLLING%s' "$Y" "$RST"; fi
+    printf -v keys '   %s  %sShift+Tab toggles%s' "$tag" "$GR" "$RST"
+  fi
+  printf -v s '%snetwatch%s  every %ss  %s(Ctrl+C to quit · blames spikes ≥ %s KB/s)%s%s' \
+    "$BOLD" "$RST" "$interval" "$GR" "$RISE" "$RST" "$keys"
+  hdr_lines+=("$s")
+  # Right-align the rate headers in the same 11-wide columns as the data (with a
+  # blank where each row's trend arrow goes) so the labels line up over the
+  # right-aligned numbers instead of floating to the left of them.
+  printf -v s '%s%-8s  %11s %s  %11s %s  %11s   %s%s' \
+    "$GR" "time" "↓ download" " " "↑ upload" " " "total" "net trend (log-scaled)" "$RST"
+  hdr_lines+=("$s")
+}
+
+# Paint the header. HDR_ROWS records its height for the scroll region and the
+# reprint cadence. Pin it when the layout is on and the terminal has rows to
+# spare; otherwise print inline and let it scroll.
+HDR_ROWS=0
+render_header() {
+  build_header
+  HDR_ROWS=${#hdr_lines[@]}
+  if (( ! STICKY_PREF )) || (( COLS == 0 )) || (( ROWS <= HDR_ROWS + 1 )); then
+    STICKY=0
+    printf '%s\n' "${hdr_lines[@]}"
+    return
+  fi
+  STICKY=1
+  printf '\e[H\e[2J'                            # home + clear screen
+  printf '%s\n' "${hdr_lines[@]}"               # header occupies rows 1..HDR_ROWS
+  printf '\e[%d;%dr' "$((HDR_ROWS+1))" "$ROWS"  # scroll region: below header .. bottom
+  printf '\e[%d;1H' "$((HDR_ROWS+1))"           # park the cursor at its top
+}
+
+# A resize refreshes the dimensions; pinned mode also repaints to re-establish
+# the scroll region. Inline mode just adopts the new size on its next screenful.
+winch_handler() { get_dims; (( STICKY )) && render_header; }
+
+# Flip the layout live (Shift+Tab). Leaving pinned mode, drop the scroll region
+# first; render_header then repaints in whichever mode the new preference picks.
+toggle_sticky() {
+  (( STICKY_PREF = ! STICKY_PREF ))
+  (( STICKY )) && printf '\e[r'
+  rows_since_hdr=0
+  render_header
+}
+
+# Idle until the next tick. On a keyboard terminal, poll stdin so a Shift+Tab
+# (ESC [ Z) toggle is handled promptly, but tick only once the full interval has
+# elapsed by the wall clock, so the rate stays divided by the real interval and
+# a keypress or resize never shortens it.
+idle() {
+  (( KB )) || { sleep "$interval"; return; }
+  local deadline to key rest
+  deadline=$(awk -v n="$(date +%s.%N)" -v i="$interval" 'BEGIN { printf "%.3f", n + i }')
+  while :; do
+    to=$(awk -v d="$deadline" -v n="$(date +%s.%N)" 'BEGIN { r = d - n; if (r <= 0) print "x"; else printf "%.3f", r }')
+    [[ $to == x ]] && return                       # deadline reached -> tick
+    if IFS= read -rsN1 -t "$to" key && [[ $key == $'\e' ]]; then
+      IFS= read -rsN2 -t 0.05 rest                 # CSI tail; Shift+Tab is ESC [ Z
+      [[ $rest == '[Z' ]] && toggle_sticky
+    fi
+    # A failed read (timeout, or a WINCH interrupt) just loops; the deadline
+    # check above decides when to actually tick, so a resize never ticks early.
+  done
+}
 
 # Prime the counters so the very first printed row already shows a real rate
 # rather than a meaningless since-boot total.
 read -r prev_rx prev_tx < <(parse_dev_totals "$NETDEV")
-prev_down=""; prev_up=""; prev_total=""
+prev_down=""; prev_up=""; prev_total=""; rows_since_hdr=0
 
-printf '%snetwatch%s  every %ss — Ctrl+C to quit   (blames traffic spikes of ≥ %s KB/s on programs)\n' \
-  "$BOLD" "$RST" "$interval" "$RISE"
-# Right-align the rate headers in the same 11-wide columns as the data (with a
-# blank where each row's trend arrow goes) so the labels line up over the
-# right-aligned numbers instead of floating to the left of them.
-printf '%s%-8s  %11s %s  %11s %s  %11s   %s%s\n' \
-  "$GR" "time" "↓ download" " " "↑ upload" " " "total" "net trend (log-scaled)" "$RST"
+get_dims
+render_header
+trap winch_handler WINCH
 
 while :; do
-  sleep "$interval"
+  idle
 
   read -r rx tx < <(parse_dev_totals "$NETDEV")
   # Per-second rates from the counter deltas. awk divides by the (possibly
@@ -302,11 +420,22 @@ while :; do
     "$(sparkline)"
 
   # culprit callout on a meaningful upward jump in total throughput
+  printed=1
   if [[ -n $prev_total ]] && (( total - prev_total >= RISE_BYTES )); then
     blame=$(culprit_net)
     jump=$(fmt_rate $(( total - prev_total )))
     printf '   %s└─ %s▲ +%s%s  busiest: %s%s%s\n' \
       "$GR" "$Y" "$jump" "$GR" "$RST" "${blame:-? (run as root to attribute sockets owned by other users)}" "$RST"
+    printed=2
+  fi
+
+  # Scrolling layout on a terminal: once a screenful of rows has gone by,
+  # reprint the header so it stays in view while the rows it scrolled past stay
+  # in scrollback. (Pinned mode keeps it fixed; piped output, COLS==0, skips.)
+  if (( ! STICKY && COLS > 0 )); then
+    screenful=$(( ROWS - HDR_ROWS )); (( screenful < 1 )) && screenful=1
+    (( rows_since_hdr += printed ))
+    if (( rows_since_hdr >= screenful )); then render_header; rows_since_hdr=0; fi
   fi
 
   prev_rx=$rx; prev_tx=$tx
